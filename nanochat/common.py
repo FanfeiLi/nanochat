@@ -62,6 +62,7 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
     """
     Downloads a file from a URL to a local path in the base directory.
     Uses a lock file to prevent concurrent downloads among multiple ranks.
+    Uses POSIX-style locking (lockf) which is compatible with Lustre filesystems.
     """
     base_dir = get_base_dir()
     file_path = os.path.join(base_dir, filename)
@@ -73,6 +74,13 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
     with FileLock(lock_path):
         # Only a single rank can acquire this lock
         # All other ranks block until it is released
+        # Use lockf() instead of flock() for Lustre filesystem compatibility
+        try:
+            fcntl.lockf(lock_file.fileno(), fcntl.LOCK_EX)
+        except OSError as e:
+            # If locking fails (e.g., not supported by filesystem), log warning and continue
+            # This is not ideal but allows the code to work on filesystems without locking support
+            print(f"Warning: File locking not supported ({e}), proceeding without lock")
 
         # Recheck after acquiring lock
         if os.path.exists(file_path):
@@ -82,7 +90,7 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
         print(f"Downloading {url}...")
         with urllib.request.urlopen(url) as response:
             content = response.read() # bytes
-
+`
         # Write to local file
         with open(file_path, 'wb') as f:
             f.write(content)
@@ -176,7 +184,7 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
 def compute_cleanup():
     """Companion function to compute_init, to clean things up before script exit"""
     if is_ddp():
-        dist.destroy_process_group()
+        dist.destroy_process_group()`
 
 class DummyWandb:
     """Useful if we wish to not use wandb but have all the same signatures"""

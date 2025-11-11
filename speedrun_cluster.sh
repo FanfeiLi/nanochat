@@ -11,6 +11,8 @@
 # WANDB_RUN=speedrun screen -L -Logfile speedrun.log -S speedrun bash speedrun.sh
 
 # Default intermediate artifacts directory is in ~/.cache/nanochat
+
+echo "starting speedrun script..."
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="/fast/fli/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
