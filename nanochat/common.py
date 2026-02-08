@@ -113,12 +113,24 @@ def print_banner():
     """
     print0(banner)
 
-def is_ddp():
-    # TODO is there a proper way
-    return int(os.environ.get('RANK', -1)) != -1
+def is_ddp_requested() -> bool:
+    """
+    True if launched by torchrun (env present), even before init.
+    Used to decide whether we *should* initialize a PG.
+    """
+    return all(k in os.environ for k in ("RANK", "LOCAL_RANK", "WORLD_SIZE"))
+
+def is_ddp_initialized() -> bool:
+    """
+    True if torch.distributed is available and the process group is initialized.
+    Used at cleanup to avoid destroying a non-existent PG.
+    """
+    return dist.is_available() and dist.is_initialized()
 
 def get_dist_info():
-    if is_ddp():
+    if is_ddp_requested():
+        # We rely on torchrun's env to decide if we SHOULD init.
+        # (Initialization itself happens in compute init.)
         assert all(var in os.environ for var in ['RANK', 'LOCAL_RANK', 'WORLD_SIZE'])
         ddp_rank = int(os.environ['RANK'])
         ddp_local_rank = int(os.environ['LOCAL_RANK'])
@@ -158,11 +170,11 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
 
     # Precision
     if device_type == "cuda":
-        torch.set_float32_matmul_precision("high") # uses tf32 instead of fp32 for matmuls
+        torch.backends.fp32_precision = "tf32" # uses tf32 instead of fp32 for matmuls
 
     # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
-    if ddp and device_type == "cuda":
+    is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+    if is_ddp_requested and device_type == "cuda":
         device = torch.device("cuda", ddp_local_rank)
         torch.cuda.set_device(device)  # make "cuda" default to this device
         dist.init_process_group(backend="nccl", device_id=device)
@@ -173,11 +185,11 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
     if ddp_rank == 0:
         logger.info(f"Distributed world size: {ddp_world_size}")
 
-    return ddp, ddp_rank, ddp_local_rank, ddp_world_size, device
+    return is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size, device
 
 def compute_cleanup():
     """Companion function to compute_init, to clean things up before script exit"""
-    if is_ddp():
+    if is_ddp_initialized():
         dist.destroy_process_group()
 
 class DummyWandb:
@@ -188,3 +200,59 @@ class DummyWandb:
         pass
     def finish(self):
         pass
+
+# hardcoded BF16 peak flops for various GPUs
+# inspired by torchtitan: https://github.com/pytorch/torchtitan/blob/main/torchtitan/tools/utils.py
+# and PR: https://github.com/karpathy/nanochat/pull/147
+def get_peak_flops(device_name: str) -> float:
+    name = device_name.lower()
+
+    # Table order matters: more specific patterns first.
+    _PEAK_FLOPS_TABLE = (
+        # NVIDIA Blackwell
+        (["gb200"], 2.5e15),
+        (["grace blackwell"], 2.5e15),
+        (["b200"], 2.25e15),
+        (["b100"], 1.8e15),
+        # NVIDIA Hopper
+        (["h200", "nvl"], 836e12),
+        (["h200", "pcie"], 836e12),
+        (["h200"], 989e12),
+        (["h100", "nvl"], 835e12),
+        (["h100", "pcie"], 756e12),
+        (["h100"], 989e12),
+        (["h800", "nvl"], 989e12),
+        (["h800"], 756e12),
+        # NVIDIA Ampere data center
+        (["a100"], 312e12),
+        (["a800"], 312e12),
+        (["a40"], 149.7e12),
+        (["a30"], 165e12),
+        # NVIDIA Ada data center
+        (["l40s"], 362e12),
+        (["l40-s"], 362e12),
+        (["l40 s"], 362e12),
+        (["l4"], 121e12),
+        # AMD CDNA accelerators
+        (["mi355"], 2.5e15),
+        (["mi325"], 1.3074e15),
+        (["mi300x"], 1.3074e15),
+        (["mi300a"], 980.6e12),
+        (["mi250x"], 383e12),
+        (["mi250"], 362.1e12),
+        # Consumer RTX
+        (["5090"], 209.5e12),
+        (["4090"], 165.2e12),
+        (["3090"], 71e12),
+    )
+    for patterns, flops in _PEAK_FLOPS_TABLE:
+        if all(p in name for p in patterns):
+            return flops
+    if "data center gpu max 1550" in name:
+        # Ponte Vecchio (PVC) - dynamic based on compute units
+        max_comp_units = torch.xpu.get_device_properties("xpu").max_compute_units
+        return 512 * max_comp_units * 1300 * 10**6
+
+    # Unknown GPU - return inf so MFU shows as 0% rather than a wrong guess
+    logger.warning(f"Peak flops undefined for: {device_name}, MFU will show as 0%")
+    return float('inf')
