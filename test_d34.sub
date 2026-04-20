@@ -1,0 +1,16 @@
+executable = /home/fli/llm_train/nanochat/test_d34.sh
+request_cpus = 32
+request_memory = 256000
+request_gpus = 8
+request_disk = 200G
+requirements = (TARGET.CUDACapability >= 9.0) && (TARGET.CUDAGlobalMemoryMb >=80000) && (TARGET.CUDADeviceName == "NVIDIA B200") && (Machine != "g187.internal.cluster.is.localnet") && (Machine != "i305.internal.cluster.is.localnet") && (Machine != "i402.internal.cluster.is.localnet")
+log_root = /home/fli/llm_train/jobs/$(ClusterId)
+error = $(log_root).err
+output = $(log_root).out
+log = $(log_root).log
+# 7 days = 604800s. d34 ratio=40 needs ~90-100h (~4 days) + SFT/eval ~2-4h.
+# 7 days gives ~3 days of headroom for slow MFU, scheduler hiccups, or a rerun.
+MaxTime = 604800
+
+periodic_remove = (JobStatus =?= 2) && ((CurrentTime - JobCurrentStartDate) >= $(MaxTime))
+queue

@@ -1,0 +1,14 @@
+executable = /home/fli/llm_train/nanochat/test_d26.sh
+request_cpus = 32
+request_memory = 256000
+request_gpus = 8
+request_disk = 200G
+requirements = (TARGET.CUDACapability >= 9.0) && (TARGET.CUDAGlobalMemoryMb >=80000) && (TARGET.CUDADeviceName == "NVIDIA B200") && (Machine != "g187.internal.cluster.is.localnet") && (Machine != "i305.internal.cluster.is.localnet") && (Machine != "i402.internal.cluster.is.localnet")
+log_root = /home/fli/llm_train/jobs/$(ClusterId)
+error = $(log_root).err
+output = $(log_root).out
+log = $(log_root).log
+MaxTime = 172800
+
+periodic_remove = (JobStatus =?= 2) && ((CurrentTime - JobCurrentStartDate) >= $(MaxTime))
+queue
