@@ -58,6 +58,26 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         torch.save(optimizer_data, optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
 
+def save_best_checkpoint(checkpoint_dir, model_data, optimizer_data, meta_data, rank=0):
+    """Overwrite-in-place 'best' snapshot: model_best.pt, meta_best.json,
+    and per-rank optim_best_rank{rank}.pt. Only one best copy ever exists on disk,
+    so storage cost is constant regardless of how often a new best is seen."""
+    if rank == 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        model_path = os.path.join(checkpoint_dir, "model_best.pt")
+        torch.save(model_data, model_path)
+        logger.info(f"Saved best model parameters to: {model_path}")
+        meta_path = os.path.join(checkpoint_dir, "meta_best.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta_data, f, indent=2)
+        logger.info(f"Saved best metadata to: {meta_path}")
+    if optimizer_data is not None:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        optimizer_path = os.path.join(checkpoint_dir, f"optim_best_rank{rank:d}.pt")
+        torch.save(optimizer_data, optimizer_path)
+        logger.info(f"Saved best optimizer state to: {optimizer_path}")
+
+
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     # Load the model state
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")

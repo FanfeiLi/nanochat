@@ -81,42 +81,32 @@ def get_base_dir():
 def download_file_with_lock(url, filename, postprocess_fn=None):
     """
     Downloads a file from a URL to a local path in the base directory.
-    Uses a lock file to prevent concurrent downloads among multiple ranks.
-    Uses POSIX-style locking (lockf) which is compatible with Lustre filesystems.
+    Uses a lock file to prevent concurrent downloads among multiple ranks,
+    and an atomic tmp+rename write so peers never observe a half-written file.
     """
     base_dir = get_base_dir()
     file_path = os.path.join(base_dir, filename)
     lock_path = file_path + ".lock"
 
-    if os.path.exists(file_path):
+    # Must check size, not just existence: a concurrent rank could have just
+    # created an empty file (bare os.path.exists() would race).
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
         return file_path
 
     with FileLock(lock_path):
-        # Only a single rank can acquire this lock
-        # All other ranks block until it is released
-        # Use lockf() instead of flock() for Lustre filesystem compatibility
-        try:
-            fcntl.lockf(lock_file.fileno(), fcntl.LOCK_EX)
-        except OSError as e:
-            # If locking fails (e.g., not supported by filesystem), log warning and continue
-            # This is not ideal but allows the code to work on filesystems without locking support
-            print(f"Warning: File locking not supported ({e}), proceeding without lock")
-
-        # Recheck after acquiring lock
-        if os.path.exists(file_path):
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
             return file_path
 
-        # Download the content as bytes
         print(f"Downloading {url}...")
         with urllib.request.urlopen(url) as response:
-            content = response.read() # bytes
+            content = response.read()
 
-        # Write to local file
-        with open(file_path, 'wb') as f:
+        tmp_path = f"{file_path}.tmp.{os.getpid()}"
+        with open(tmp_path, 'wb') as f:
             f.write(content)
+        os.replace(tmp_path, file_path)  # atomic
         print(f"Downloaded to {file_path}")
 
-        # Run the postprocess function if provided
         if postprocess_fn is not None:
             postprocess_fn(file_path)
 
@@ -205,7 +195,8 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
     if is_ddp_requested and device_type == "cuda":
         device = torch.device("cuda", ddp_local_rank)
         torch.cuda.set_device(device)  # make "cuda" default to this device
-        dist.init_process_group(backend="nccl", device_id=device)
+        from datetime import timedelta
+        dist.init_process_group(backend="nccl", device_id=device, timeout=timedelta(minutes=60))
         dist.barrier()
     else:
         device = torch.device(device_type) # mps|cpu

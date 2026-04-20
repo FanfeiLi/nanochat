@@ -29,7 +29,7 @@ from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, save_best_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -75,6 +75,8 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--save-every-early", type=int, default=-1, help="dense save interval used BEFORE --save-early-until-step; -1 disables the tiered schedule")
+parser.add_argument("--save-early-until-step", type=int, default=0, help="use --save-every-early for step <= this value, then fall back to --save-every")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -84,6 +86,21 @@ user_config = vars(args).copy()  # for logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+
+# -----------------------------------------------------------------------------
+# Per-rank debug logger. Writes to stderr with a monotonic clock so we can
+# align events across ranks after a crash. Enabled by NANOCHAT_DEBUG=1.
+# Silent by default so this is safe to leave in production code.
+import sys as _sys
+_DBG_ENABLED = os.environ.get("NANOCHAT_DEBUG", "0") == "1"
+_DBG_T0 = time.monotonic()
+def dbg(msg):
+    if not _DBG_ENABLED:
+        return
+    dt = time.monotonic() - _DBG_T0
+    rank = ddp_rank if ddp else 0
+    print(f"[DBG rank{rank} t+{dt:7.2f}s] {msg}", file=_sys.stderr, flush=True)
+dbg("post compute_init")
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
@@ -243,7 +260,9 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
+dbg("pre torch.compile")
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+dbg("post torch.compile (tracing will happen on first forward call)")
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -328,9 +347,12 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
+dbg("pre train_loader construct")
 train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+dbg("post train_loader construct; pre first next(train_loader)")
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+dbg(f"post first next(train_loader): x.shape={tuple(x.shape)}")
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
@@ -412,21 +434,63 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+# Sync all ranks after setup (FP8 conversion, torch.compile graph registration,
+# dataloader init, scaling-law compute) and before the first forward pass.
+# First-step drift across ranks — from torch.compile tracing, FA3 kernel
+# autotune, or slow Lustre reads — is the main cause of NCCL watchdog timeouts
+# at step 0. This barrier forces the slowest rank to catch up once, in a
+# non-collective context, so the subsequent collectives don't race the watchdog.
+if ddp:
+    dbg("pre post-init barrier")
+    print0("Synchronizing all ranks before training loop (post-init barrier)...")
+    import torch.distributed as _dist
+    _dist.barrier()
+    dbg("post post-init barrier")
+    print0("Barrier passed, entering training loop.")
+
 # Go!
+dbg("entering training loop")
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
+    if step < 3:
+        dbg(f"top of loop step={step}")
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
+        dbg(f"step={step} pre validation")
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model):
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        dbg(f"step={step} post validation bpb={val_bpb:.4f}")
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
+            # Save-on-best: overwrite model_best.pt + optim_best_rank*.pt in place.
+            # Keeps optimizer state so training can be resumed from the best point.
+            save_best_checkpoint(
+                checkpoint_dir,
+                orig_model.state_dict(),
+                optimizer.state_dict(),
+                {
+                    "step": step,
+                    "val_bpb": val_bpb,
+                    "model_config": model_config_kwargs,
+                    "user_config": user_config,
+                    "device_batch_size": args.device_batch_size,
+                    "max_seq_len": args.max_seq_len,
+                    "total_batch_size": total_batch_size,
+                    "dataloader_state_dict": dataloader_state_dict,
+                    "loop_state": {
+                        "min_val_bpb": min_val_bpb,
+                        "smooth_train_loss": smooth_train_loss,
+                        "total_training_time": total_training_time,
+                    },
+                },
+                rank=ddp_rank,
+            )
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
@@ -474,7 +538,12 @@ while True:
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    # Tiered schedule: use --save-every-early for step <= --save-early-until-step, then fall back to --save-every
+    if args.save_every_early > 0 and step <= args.save_early_until_step:
+        _save_interval = args.save_every_early
+    else:
+        _save_interval = args.save_every
+    if last_step or (step > 0 and step != args.resume_from_step and _save_interval > 0 and step % _save_interval == 0):
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -505,18 +574,47 @@ while True:
     # -------------------------------------------------------------------------
     # single training step
     # evaluate the gradient
+    if step < 3:
+        dbg(f"step={step} pre synchronize()")
     synchronize()
+    if step < 3:
+        dbg(f"step={step} post synchronize(), starting {grad_accum_steps} micro-steps")
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
+        if step < 2 and micro_step < 3:
+            dbg(f"step={step} micro={micro_step} pre forward")
         loss = model(x, y)
+        if step < 2 and micro_step < 3:
+            dbg(f"step={step} micro={micro_step} post forward, pre backward")
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        if step < 2 and micro_step < 3:
+            dbg(f"step={step} micro={micro_step} post backward, pre next(train_loader)")
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        if step < 2 and micro_step < 3:
+            dbg(f"step={step} micro={micro_step} post next(train_loader)")
+
+    # COMPILE-DRIFT BARRIER (step 0 only): the very first distributed collective
+    # in this codebase is dist.all_reduce on a 1-element scalar parameter inside
+    # DistMuonAdamW.step() (see optim.py:378). torch.compile autotune is non-
+    # deterministic and can finish 5-15 minutes apart across ranks. If rank 0
+    # arrives at the optimizer step while ranks 4-7 are still autotuning kernels
+    # in their first backward pass, NCCL hits its 10-min collective watchdog and
+    # the job dies with the SeqNum=2 ALLREDUCE NumelIn=1 timeout we kept seeing.
+    # Forcing all ranks to meet here ensures compilation is fully done before any
+    # of them issues the first optimizer collective.
+    if step == 0 and ddp:
+        dbg("step=0 pre compile-drift barrier (waiting for all ranks to finish first backward)")
+        _dist.barrier()
+        dbg("step=0 post compile-drift barrier")
+
     # step the optimizer
+    if step < 3:
+        dbg(f"step={step} pre optimizer.step()")
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(step)
@@ -537,6 +635,8 @@ while True:
         scaler.update()
     else:
         optimizer.step()
+    if step < 3:
+        dbg(f"step={step} post optimizer.step()")
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
