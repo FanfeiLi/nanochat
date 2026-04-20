@@ -1,0 +1,13 @@
+executable = /home/fli/llm_train/nanochat/data_prep/rewrite_rowgroups.sh
+request_cpus = 16
+request_memory = 64000
+request_disk = 500G
+request_gpus = 0
+log_root = /home/fli/llm_train/jobs/$(ClusterId)_rewrite_rg
+error = $(log_root).err
+output = $(log_root).out
+log = $(log_root).log
+MaxTime = 14400
+
+periodic_remove = (JobStatus =?= 2) && ((CurrentTime - JobCurrentStartDate) >= $(MaxTime))
+queue
